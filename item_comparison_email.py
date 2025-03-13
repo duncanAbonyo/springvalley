@@ -51,12 +51,18 @@ def send_email_report(email_address, email_password, recipient_email, report_fil
         msg = MIMEMultipart()
         msg['From'] = email_address
         msg['To'] = recipient_email
-        msg['Subject'] = f'Item Detection Report - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        msg['Subject'] = f'Item Comparison Report - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
-        # Create simple email body
-        body = f"Item Detection Report\n\n"
-        body += f"Please find attached the latest detection report.\n"
-        body += f"Report generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        # Read report to get summary
+        report_df = pd.read_csv(report_file)
+        
+        # Create email body
+        body = f"Item Comparison Report Summary:\n\n"
+        body += f"Total Matches Found: {len(report_df)}\n"
+        body += "Top 5 Matched Items:\n"
+        top_items = report_df['Detected_Item'].value_counts().head(5)
+        for item, count in top_items.items():
+            body += f"- {item}: {count} matches\n"
 
         # Attach the CSV file
         with open(report_file, 'rb') as f:
@@ -84,7 +90,7 @@ def compare_detections():
         detections_df = pd.read_csv('detections.csv')
         
         # Convert timestamp strings to datetime objects
-        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'])
+        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'],format='%Y-%m-%d_%H-%M-%S',errors='coerce')
         
         # Get database items
         db_items = get_db_items()
@@ -104,6 +110,9 @@ def compare_detections():
             detected_object = detection['Object']
             normalized_detected = normalize_text(detected_object)
             
+            # Convert confidence to percentage for reporting
+            confidence_pct = detection['Confidence'] * 100
+            
             best_match = None
             highest_ratio = 0
             
@@ -113,25 +122,31 @@ def compare_detections():
                     normalized_db = normalize_text(db_desc)
                     ratio = fuzz.ratio(normalized_detected, normalized_db)
                     
-                    # Only consider matches where the fuzzy match ratio is > 80
-                    if ratio > highest_ratio and ratio > 80:
+                    # Only consider matches where:
+                    # 1. The fuzzy match ratio is > 80
+                    # 2. The confidence is > 0.5 (50%)
+                    if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
                         highest_ratio = ratio
                         best_match = (db_desc, db_time)
             
             if best_match:
                 matches.append({
                     'Detected_Item': detected_object,
-                    'Detection_Time': detection_time.strftime('%Y-%m-%d %H:%M:%S')
+                    'DB_Item': best_match[0],
+                    'Detection_Time': detection_time,
+                    'DB_LastUpdated': best_match[1],
+                    'Confidence': f"{confidence_pct:.2f}%",  
+                    'Match_Score': f"{highest_ratio}%"
                 })
         
-        # Save matches to a report file - SIMPLIFIED VERSION
+        # Save matches to a report file
         matches_df = pd.DataFrame(matches)
         if not matches_df.empty:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            report_filename = f'detection_report_{timestamp}.csv'
+            report_filename = f'comparison_report_{timestamp}.csv'
             matches_df.to_csv(report_filename, index=False)
-            print(f"Detection report generated: {report_filename}")
-            print(f"Found {len(matches)} matches")
+            print(f"Comparison report generated: {report_filename}")
+            print(f"Found {len(matches)} matches with confidence > 60%")
             
             # Send email with report
             email_address = os.getenv('EMAIL_ADDRESS')
@@ -150,9 +165,9 @@ def compare_detections():
 
 def run_comparison_scheduler():
     """Run the comparison at specified intervals"""
-    interval_minutes = int(os.getenv('COMPARISON_INTERVAL_MINUTES', 60))
+    interval_minutes = int(os.getenv('COMPARISON_INTERVAL_MINUTES', 5))
     
-    print(f"Starting detection report scheduler (interval: {interval_minutes} minutes)")
+    print(f"Starting comparison scheduler (interval: {interval_minutes} minutes)")
     
     # Run initial comparison immediately
     compare_detections()
