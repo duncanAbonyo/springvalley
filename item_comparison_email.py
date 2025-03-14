@@ -44,7 +44,7 @@ def get_db_items():
     cursor.close()
     conn.close()
     return items
-
+    
 def send_email_report(email_address, email_password, recipient_email, report_file):
     """Send email with comparison report"""
     try:
@@ -53,16 +53,25 @@ def send_email_report(email_address, email_password, recipient_email, report_fil
         msg['To'] = recipient_email
         msg['Subject'] = f'Item Comparison Report - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
-        # Read report to get summary
+        # Read the report to get a summary
         report_df = pd.read_csv(report_file)
-        
+
         # Create email body
         body = f"Item Comparison Report Summary:\n\n"
-        body += f"Total Matches Found: {len(report_df)}\n"
-        body += "Top 5 Matched Items:\n"
-        top_items = report_df['Detected_Item'].value_counts().head(5)
-        for item, count in top_items.items():
-            body += f"- {item}: {count} matches\n"
+        total_matches = len(report_df)
+        
+        if total_matches > 0:
+            body += f"Total Matches Found: {total_matches}\n"
+            body += f"Summary of Detected Items:\n"
+            
+            # Group items and their match count
+            item_counts = report_df['Detected_Item'].value_counts()
+            for item, count in item_counts.items():
+                body += f"- {item}: {count} matches\n"
+
+            body += f"\nFor detailed information, please find the attached report file."
+        else:
+            body += "No matches were detected within the specified time window."
 
         # Attach the CSV file
         with open(report_file, 'rb') as f:
@@ -79,7 +88,7 @@ def send_email_report(email_address, email_password, recipient_email, report_fil
             server.send_message(msg)
 
         print(f"Email report sent successfully at {datetime.now()}")
-        
+
     except Exception as e:
         print(f"Error sending email: {e}")
 
@@ -90,15 +99,15 @@ def compare_detections():
         detections_df = pd.read_csv('detections.csv')
         
         # Convert timestamp strings to datetime objects
-        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'],format='%Y-%m-%d_%H-%M-%S',errors='coerce')
-        
+        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'], format='%Y-%m-%d_%H-%M-%S', errors='coerce')
+
         # Get database items
         db_items = get_db_items()
-        
+
         matches = []
         # Get current time for comparison
         current_time = datetime.now()
-        
+
         # Process each detection
         for _, detection in detections_df.iterrows():
             detection_time = detection['Timestamp']
@@ -106,59 +115,62 @@ def compare_detections():
             # Skip if detection is older than 20 minutes
             if current_time - detection_time > timedelta(minutes=20):
                 continue
-                
+
             detected_object = detection['Object']
             normalized_detected = normalize_text(detected_object)
-            
+
             # Convert confidence to percentage for reporting
             confidence_pct = detection['Confidence'] * 100
-            
+
             best_match = None
             highest_ratio = 0
-            
+
             # Compare with database items
             for db_desc, db_time in db_items:
                 if db_desc:
                     normalized_db = normalize_text(db_desc)
                     ratio = fuzz.ratio(normalized_detected, normalized_db)
-                    
+
                     # Only consider matches where:
                     # 1. The fuzzy match ratio is > 80
                     # 2. The confidence is > 0.5 (50%)
                     if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
                         highest_ratio = ratio
                         best_match = (db_desc, db_time)
-            
+
             if best_match:
+                detection_time = detection_time if pd.notna(detection_time) else best_match[1]
                 matches.append({
                     'Detected_Item': detected_object,
                     'DB_Item': best_match[0],
                     'Detection_Time': detection_time,
                     'DB_LastUpdated': best_match[1],
-                  
                 })
-        
+
+        # Create DataFrame and drop duplicates
+        matches_df = pd.DataFrame(matches).drop_duplicates(subset=['Detected_Item'])
+        matches_df['Detection_Time'].fillna(matches_df['DB_LastUpdated'], inplace=True)
+
         # Save matches to a report file
-        matches_df = pd.DataFrame(matches)
         if not matches_df.empty:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            report_filename = f'comparison_report_{timestamp}.csv'
+            report_filename = f'enhanced_comparison_report_{timestamp}.csv'
             matches_df.to_csv(report_filename, index=False)
-            print(f"Comparison report generated: {report_filename}")
+            print(f"Enhanced comparison report generated: {report_filename}")
             print(f"Found {len(matches)} matches with confidence > 60%")
-            
+
             # Send email with report
             email_address = os.getenv('EMAIL_ADDRESS')
             email_password = os.getenv('EMAIL_PASSWORD')
             recipient_email = os.getenv('RECIPIENT_EMAIL')
-            
+
             if email_address and email_password and recipient_email:
                 send_email_report(email_address, email_password, recipient_email, report_filename)
             else:
                 print("Email credentials not fully configured. Skipping email.")
         else:
             print("No matches found in the current time window")
-            
+
     except Exception as e:
         print(f"Error during comparison: {e}")
 
