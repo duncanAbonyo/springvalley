@@ -10,9 +10,6 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
-from datetime import datetime, timedelta
-import pandas as pd
-
 
 # Load environment variables
 load_dotenv()
@@ -85,60 +82,62 @@ def send_email_report(email_address, email_password, recipient_email, report_fil
         
     except Exception as e:
         print(f"Error sending email: {e}")
+
 def compare_detections():
-    """Compare detected items with database entries and return matched results."""
+    """Compare detected items with database entries"""
     try:
         # Read detections from CSV
         detections_df = pd.read_csv('detections.csv')
-
+        
         # Convert timestamp strings to datetime objects
-        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'], format='%Y-%m-%d_%H-%M-%S', errors='coerce')
-
+        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'],format='%Y-%m-%d_%H-%M-%S',errors='coerce')
+        
         # Get database items
         db_items = get_db_items()
-
-        # Define the reasonable time difference (e.g., 1 minute)
-        time_threshold = timedelta(minutes=5)
         
-        # Define the fuzzy matching threshold (e.g., 70%)
-        fuzzy_threshold = 70
-
         matches = []
-
+        # Get current time for comparison
+        current_time = datetime.now()
+        
         # Process each detection
         for _, detection in detections_df.iterrows():
             detection_time = detection['Timestamp']
+            
+            # Skip if detection is older than 20 minutes
+            if current_time - detection_time > timedelta(minutes=20):
+                continue
+                
             detected_object = detection['Object']
-
+            normalized_detected = normalize_text(detected_object)
+            
+            # Convert confidence to percentage for reporting
+            confidence_pct = detection['Confidence'] * 100
+            
             best_match = None
-            best_score = 0
-
+            highest_ratio = 0
+            
             # Compare with database items
             for db_desc, db_time in db_items:
                 if db_desc:
-                    # Calculate fuzzy similarity
-                    similarity_score = fuzz.ratio(detected_object, db_desc)
-
-                    # Check if the similarity score passes the threshold and time difference is reasonable
-                    if pd.isna(detection_time) or pd.isna(db_time):
-                        continue  # Skip comparison if either timestamp is NaT
-                    time_difference = abs((detection_time - db_time))
-                    if similarity_score >= fuzzy_threshold and time_difference <= time_threshold:
-                        # Update best match if this score is higher
-                        if similarity_score > best_score:
-                            best_score = similarity_score
-                            best_match = (db_desc, db_time)
-
-            # If a match is found, add to the results
+                    normalized_db = normalize_text(db_desc)
+                    ratio = fuzz.ratio(normalized_detected, normalized_db)
+                    
+                    # Only consider matches where:
+                    # 1. The fuzzy match ratio is > 80
+                    # 2. The confidence is > 0.5 (50%)
+                    if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
+                        highest_ratio = ratio
+                        best_match = (db_desc, db_time)
+            
             if best_match:
                 matches.append({
                     'Detected_Item': detected_object,
-                    'Database_Item': best_match[0],
-                    'Detection_Time': detection_time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'Database_Time': best_match[1].strftime('%Y-%m-%d %H:%M:%S'),
-                    'Similarity_Score': best_score
+                    'DB_Item': best_match[0],
+                    'Detection_Time': detection_time,
+                    'DB_LastUpdated': best_match[1],
+                  
                 })
-
+        
         # Save matches to a report file
         matches_df = pd.DataFrame(matches)
         if not matches_df.empty:
@@ -146,25 +145,22 @@ def compare_detections():
             report_filename = f'comparison_report_{timestamp}.csv'
             matches_df.to_csv(report_filename, index=False)
             print(f"Comparison report generated: {report_filename}")
-            print(f"Found {len(matches)} matches with similarity >= {fuzzy_threshold}%")
-
+            print(f"Found {len(matches)} matches with confidence > 60%")
+            
             # Send email with report
             email_address = os.getenv('EMAIL_ADDRESS')
             email_password = os.getenv('EMAIL_PASSWORD')
             recipient_email = os.getenv('RECIPIENT_EMAIL')
-
+            
             if email_address and email_password and recipient_email:
                 send_email_report(email_address, email_password, recipient_email, report_filename)
             else:
                 print("Email credentials not fully configured. Skipping email.")
         else:
             print("No matches found in the current time window")
-
-        return matches
-
+            
     except Exception as e:
         print(f"Error during comparison: {e}")
-        return []
 
 def run_comparison_scheduler():
     """Run the comparison at specified intervals"""
