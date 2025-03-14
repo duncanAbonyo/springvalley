@@ -43,6 +43,7 @@ def get_db_items():
     
     cursor.close()
     conn.close()
+    
     return items
     
 def send_email_report(email_address, email_password, recipient_email, report_file):
@@ -125,20 +126,33 @@ def compare_detections():
             best_match = None
             highest_ratio = 0
 
-            # Compare with database items
+            # # Compare with database items
+            # for db_desc, db_time in db_items:
+            #     if db_desc:
+            #         normalized_db = normalize_text(db_desc)
+            #         ratio = fuzz.ratio(normalized_detected, normalized_db)
+
+            #         # Only consider matches where:
+            #         # 1. The fuzzy match ratio is > 80
+            #         # 2. The confidence is > 0.5 (50%)
+            #         if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
+            #             highest_ratio = ratio
+            #             best_match = (db_desc, db_time)
             for db_desc, db_time in db_items:
                 if db_desc:
                     normalized_db = normalize_text(db_desc)
                     ratio = fuzz.ratio(normalized_detected, normalized_db)
-
-                    # Only consider matches where:
-                    # 1. The fuzzy match ratio is > 80
-                    # 2. The confidence is > 0.5 (50%)
-                    if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
-                        highest_ratio = ratio
-                        best_match = (db_desc, db_time)
-
-            if best_match:
+            
+                    # Check if both timestamps are from the same day
+                    if detection_time.date() == db_time.date():
+                        # Only consider matches where:
+                        # 1. The fuzzy match ratio is > 80
+                        # 2. The confidence is > 0.5 (50%)
+                        if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
+                            highest_ratio = ratio
+                            best_match = (db_desc, db_time)
+    
+                if best_match:
                 detection_time = detection_time if pd.notna(detection_time) else best_match[1]
                 matches.append({
                     'Detected_Item': detected_object,
