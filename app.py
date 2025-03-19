@@ -1,200 +1,182 @@
-#detector.py
-import cv2
+import pandas as pd
 import time
-import threading
-import queue
+from datetime import datetime, timedelta
 import os
-import csv
 from dotenv import load_dotenv
-import signal
-from ultralytics import YOLO
+import pyodbc
+from fuzzywuzzy import fuzz
+import schedule
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 
 # Load environment variables
 load_dotenv()
 
-# Graceful shutdown flag
-shutdown_event = threading.Event()
+def normalize_text(text):
+    """Normalize text by removing special characters and converting to lowercase"""
+    return ''.join(c.lower() for c in text if c.isalnum())
 
-# Bufferless VideoCapture class
-class VideoCapture:
-    def __init__(self, name):
-        self.cap = cv2.VideoCapture(name)
-        self.q = queue.Queue()
-        self.running = True
-        self.t = threading.Thread(target=self._reader)
-        self.t.daemon = True
-        self.t.start()
+def get_db_connection():
+    """Create database connection"""
+    server = os.getenv('SERVER_')
+    database = os.getenv('DATABASE_')
+    username = os.getenv('USERNAME_')
+    password = os.getenv('PASSWORD_')
+    
+    conn = pyodbc.connect(
+        f'DRIVER={{ODBC Driver 17 for SQL Server}};'
+        f'SERVER={server};DATABASE={database};'
+        f'UID={username};PWD={password}'
+    )
+    return conn
 
-    def _reader(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            if not self.q.empty():
-                try:
-                    self.q.get_nowait()  # Discard previous frame
-                except queue.Empty:
-                    pass
-            self.q.put(frame)
-            self.state = ret
+def get_db_items():
+    """Fetch items from database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    query = "SELECT Description, LastUpdated FROM Item"
+    cursor.execute(query)
+    items = [(row.Description, row.LastUpdated) for row in cursor.fetchall()]
+    
+    cursor.close()
+    conn.close()
+    return items
 
-    def read(self):
-        return self.q.get(), self.state
+def send_email_report(email_address, email_password, recipient_email, report_file):
+    """Send email with comparison report"""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = email_address
+        msg['To'] = recipient_email
+        msg['Subject'] = f'Item Comparison Report - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
-    def stop(self):
-        self.running = False
-        self.t.join()
-        self.cap.release()
+        # Read report to get summary
+        report_df = pd.read_csv(report_file)
+        
+        # Create email body
+        body = f"Item Comparison Report Summary:\n\n"
+        body += f"Total Matches Found: {len(report_df)}\n"
+        body += "Top 5 Matched Items:\n"
+        top_items = report_df['Detected_Item'].value_counts().head(5)
+        for item, count in top_items.items():
+            body += f"- {item}: {count} matches\n"
 
-def detect_objects(model, frame):
-    """
-    Run object detection on the frame using YOLOv8.
-    """
-    results = model(frame)
-    return results
+        # Attach the CSV file
+        with open(report_file, 'rb') as f:
+            part = MIMEApplication(f.read(), Name=os.path.basename(report_file))
+        part['Content-Disposition'] = f'attachment; filename="{os.path.basename(report_file)}"'
+        
+        msg.attach(MIMEText(body, 'plain'))
+        msg.attach(part)
 
+        # Send email
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(email_address, email_password)
+            server.send_message(msg)
 
-def save_to_csv(csv_file, detections, timestamp):
-    """
-    Save detected objects and their timestamps to a CSV file.
-    """
-    with open(csv_file, mode="a", newline="") as file:
-        writer = csv.writer(file)
-        for obj in detections:
-            writer.writerow([timestamp, obj["label"], obj["confidence"]])
+        print(f"Email report sent successfully at {datetime.now()}")
+        
+    except Exception as e:
+        print(f"Error sending email: {e}")
 
+def compare_detections():
+    """Compare detected items with database entries"""
+    try:
+        # Read detections from CSV
+        detections_df = pd.read_csv('detections.csv')
+        
+        # Convert timestamp strings to datetime objects
+        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'],format='%Y-%m-%d_%H-%M-%S',errors='coerce')
+        
+        # Get database items
+        db_items = get_db_items()
+        
+        matches = []
+        # Get current time for comparison
+        current_time = datetime.now()
+        
+        # Process each detection
+        for _, detection in detections_df.iterrows():
+            detection_time = detection['Timestamp']
+            
+            # Skip if detection is older than 20 minutes
+            if current_time - detection_time > timedelta(minutes=20):
+                continue
+                
+            detected_object = detection['Object']
+            normalized_detected = normalize_text(detected_object)
+            
+            # Convert confidence to percentage for reporting
+            confidence_pct = detection['Confidence'] * 100
+            
+            best_match = None
+            highest_ratio = 0
+            
+            # Compare with database items
+            for db_desc, db_time in db_items:
+                if db_desc:
+                    normalized_db = normalize_text(db_desc)
+                    ratio = fuzz.ratio(normalized_detected, normalized_db)
+                    
+                    # Only consider matches where:
+                    # 1. The fuzzy match ratio is > 80
+                    # 2. The confidence is > 0.5 (50%)
+                    if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
+                        highest_ratio = ratio
+                        best_match = (db_desc, db_time)
+            
+            if best_match:
+                matches.append({
+                    'Detected_Item': detected_object,
+                    'DB_Item': best_match[0],
+                    'Detection_Time': detection_time,
+                    'DB_LastUpdated': best_match[1],
+                    'Confidence': f"{confidence_pct:.2f}%",  # Format as percentage with 2 decimal places
+                    'Match_Score': f"{highest_ratio}%"
+                })
+        
+        # Save matches to a report file
+        matches_df = pd.DataFrame(matches)
+        if not matches_df.empty:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            report_filename = f'comparison_report_{timestamp}.csv'
+            matches_df.to_csv(report_filename, index=False)
+            print(f"Comparison report generated: {report_filename}")
+            print(f"Found {len(matches)} matches with confidence > 60%")
+            
+            # Send email with report
+            email_address = os.getenv('EMAIL_ADDRESS')
+            email_password = os.getenv('EMAIL_PASSWORD')
+            recipient_email = os.getenv('RECIPIENT_EMAIL')
+            
+            if email_address and email_password and recipient_email:
+                send_email_report(email_address, email_password, recipient_email, report_filename)
+            else:
+                print("Email credentials not fully configured. Skipping email.")
+        else:
+            print("No matches found in the current time window")
+            
+    except Exception as e:
+        print(f"Error during comparison: {e}")
 
-def display_stream(rtsp_url, window_name, frame_rate=28, model=None, csv_file="detections.csv"):
-    """
-    Display an RTSP stream in a window with object detection and save results to a CSV file.
-    """
-    vs = VideoCapture(rtsp_url)
-    fps = 0
-    start_time2 = time.time()
-
-    # Open CSV file and write header if it doesn't exist
-    if not os.path.exists(csv_file):
-        with open(csv_file, mode="w", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow(["Timestamp", "Object", "Confidence"])
-
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    while not shutdown_event.is_set():
-        frame, success = vs.read()
-        if not success:
-            break
-
-        start_time = time.time()
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
-
-        # Run object detection
-        results = detect_objects(model, frame)
-
-        # Parse detections
-        detections = []
-        for box in results[0].boxes:  # YOLOv8 uses `results[0].boxes` for bounding boxes
-            x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
-            confidence = box.conf[0].item()  # Confidence score
-            label = model.names[int(box.cls[0].item())]  # Class label
-            detections.append({"label": label, "confidence": confidence, "bbox": (x1, y1, x2, y2)})
-
-        # Save detections to CSV
-        save_to_csv(csv_file, detections, timestamp)
-
-        # Annotate frame with detections
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox"]
-            label = det["label"]
-            confidence = det["confidence"]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                frame,
-                f"{label} ({confidence:.2f})",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                2,
-            )
-
-        # Calculate FPS
-        loop_time2 = time.time() - start_time
-        if loop_time2 > 0:
-            fps = 0.9 * fps + 0.1 / loop_time2
-        cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
-
-        cv2.imshow(window_name, frame)
-        delay = max(1, int((1 / frame_rate - loop_time2) * 1000))
-        key = cv2.waitKey(delay) & 0xFF
-
-        if key == ord("q") or shutdown_event.is_set():
-            break
-
-    total_time = time.time() - start_time2
-    print(f"Total time for {window_name}: {total_time:.2f} seconds")
-
-    cv2.destroyWindow(window_name)
-    vs.stop()
-
-
-def load_rtsp_urls():
-    """
-    Load RTSP URLs from the .env file.
-    """
-    urls = []
-    index = 1
+def run_comparison_scheduler():
+    """Run the comparison at specified intervals"""
+    interval_minutes = int(os.getenv('COMPARISON_INTERVAL_MINUTES', 5))
+    
+    print(f"Starting comparison scheduler (interval: {interval_minutes} minutes)")
+    
+    # Run initial comparison immediately
+    compare_detections()
+    
+    schedule.every(interval_minutes).minutes.do(compare_detections)
+    
     while True:
-        url = os.getenv(f"RTSP_URL_{index}")
-        if not url:
-            break
-        urls.append(url)
-        index += 1
-    return urls
-
-
-def signal_handler(signal, frame):
-    """
-    Handle graceful shutdown signals.
-    """
-    print("Shutting down...")
-    shutdown_event.set()
-
-
-def run_streams(rtsp_urls, frame_rate=14):
-    """
-    Start threads for each RTSP stream.
-    """
-    # Load YOLOv8 model
-    # model = YOLO("best3.pt")  
-    model =YOLO("best.pt")
-    csv_file = "detections.csv"
-
-    threads = []
-    for i, url in enumerate(rtsp_urls):
-        t = threading.Thread(target=display_stream, args=(url, f"Stream {i + 1}", frame_rate, model, csv_file))
-        t.start()
-        threads.append(t)
-
-    # Wait for all threads to finish
-    for t in threads:
-        t.join()
-
-
-def main():
-    """
-    Main function to load URLs and start the streaming.
-    """
-    signal.signal(signal.SIGINT, signal_handler)  # Handle Ctrl+C
-    signal.signal(signal.SIGTERM, signal_handler)  # Handle termination signal
-
-    rtsp_urls = load_rtsp_urls()
-    if not rtsp_urls:
-        print("No RTSP URLs found in .env file.")
-        return
-
-    print("Starting streams...")
-    run_streams(rtsp_urls)
-
+        schedule.run_pending()
+        time.sleep(1)
 
 if __name__ == "__main__":
-    main()
+    run_comparison_scheduler()
