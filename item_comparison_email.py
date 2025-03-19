@@ -45,41 +45,90 @@ def get_db_items():
     conn.close()
     
     return items
-    
+
 def send_email_report(email_address, email_password, recipient_email, report_file):
     """Send email with comparison report"""
     try:
         msg = MIMEMultipart()
         msg['From'] = email_address
         msg['To'] = recipient_email
-        msg['Subject'] = f'Item Comparison Report - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        msg['Subject'] = f'Product Detection Report - {datetime.now().strftime("%Y-%m-%d")}'
 
         # Read the report to get a summary
         report_df = pd.read_csv(report_file)
-
-        # Create email body
-        body = f"Item Comparison Report Summary:\n\n"
-        total_matches = len(report_df)
         
-        if total_matches > 0:
-            body += f"Total Matches Found: {total_matches}\n"
-            body += f"Summary of Detected Items:\n"
+        # Create HTML email body for better formatting
+        html_body = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #f2f2f2; }}
+                tr:nth-child(even) {{ background-color: #f9f9f9; }}
+                .summary {{ margin-bottom: 20px; }}
+            </style>
+        </head>
+        <body>
+            <h2>Product Detection Report</h2>
+            <p>Detection period: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
             
-            # Group items and their match count
-            item_counts = report_df['Detected_Item'].value_counts()
-            for item, count in item_counts.items():
-                body += f"- {item}: {count} matches\n"
-
-            body += f"\nFor detailed information, please find the attached report file."
+            <div class="summary">
+                <h3>Summary</h3>
+                <p>Total Products Detected: {len(report_df)}</p>
+            </div>
+        """
+        
+        if not report_df.empty:
+            # Add product detection table
+            html_body += """
+            <h3>Detected Products</h3>
+            <table>
+                <tr>
+                    <th>Product</th>
+                    <th>Detection Time</th>
+                </tr>
+            """
+            
+            for _, row in report_df.iterrows():
+                detection_time = pd.to_datetime(row['Detection_Time']).strftime("%Y-%m-%d %H:%M:%S")
+                html_body += f"""
+                <tr>
+                    <td>{row['Detected_Item']}</td>
+                    <td>{detection_time}</td>
+                </tr>
+                """
+            
+            html_body += "</table>"
+            html_body += "<p>Please find the detailed report attached.</p>"
         else:
-            body += "No matches were detected within the specified time window."
-
+            html_body += "<p>No products were detected during this period.</p>"
+        
+        html_body += """
+            </body>
+            </html>
+        """
+        
+        # Create plain text version for email clients that don't support HTML
+        plain_text = f"""
+        Product Detection Report
+        Detection period: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        
+        Summary:
+        Total Products Detected: {len(report_df)}
+        
+        Please see the attached CSV file for detailed information.
+        """
+        
+        # Attach the HTML and plain text versions
+        msg.attach(MIMEText(plain_text, 'plain'))
+        msg.attach(MIMEText(html_body, 'html'))
+        
         # Attach the CSV file
         with open(report_file, 'rb') as f:
             part = MIMEApplication(f.read(), Name=os.path.basename(report_file))
         part['Content-Disposition'] = f'attachment; filename="{os.path.basename(report_file)}"'
-        
-        msg.attach(MIMEText(body, 'plain'))
         msg.attach(part)
 
         # Send email
@@ -126,24 +175,13 @@ def compare_detections():
             best_match = None
             highest_ratio = 0
 
-            # # Compare with database items
-            # for db_desc, db_time in db_items:
-            #     if db_desc:
-            #         normalized_db = normalize_text(db_desc)
-            #         ratio = fuzz.ratio(normalized_detected, normalized_db)
-
-            #         # Only consider matches where:
-            #         # 1. The fuzzy match ratio is > 80
-            #         # 2. The confidence is > 0.5 (50%)
-            #         if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
-            #             highest_ratio = ratio
-            #             best_match = (db_desc, db_time)
+            # Compare with database items - ONLY MATCH WITHIN THE SAME DAY
             for db_desc, db_time in db_items:
-                if db_desc:
+                if db_desc and detection_time and db_time:
                     normalized_db = normalize_text(db_desc)
                     ratio = fuzz.ratio(normalized_detected, normalized_db)
-            
-                    # Check if both timestamps are from the same day
+                    
+                    # CRITICAL: Only consider matches from the same day
                     if detection_time.date() == db_time.date():
                         # Only consider matches where:
                         # 1. The fuzzy match ratio is > 80
@@ -151,27 +189,36 @@ def compare_detections():
                         if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
                             highest_ratio = ratio
                             best_match = (db_desc, db_time)
-    
-                if best_match:
-                detection_time = detection_time if pd.notna(detection_time) else best_match[1]
+            
+            if best_match:
+                # Use db_time if we have a match (since we're already ensuring same-day matches)
+                # This helps in case the time recording had slight differences
+                final_time = best_match[1]
+                
                 matches.append({
                     'Detected_Item': detected_object,
                     'DB_Item': best_match[0],
-                    'Detection_Time': detection_time,
-                    'DB_LastUpdated': best_match[1],
+                    'Detection_Time': final_time,
+                    'Match_Confidence': highest_ratio
                 })
 
-        # Create DataFrame and drop duplicates
-        matches_df = pd.DataFrame(matches).drop_duplicates(subset=['Detected_Item'])
-        matches_df['Detection_Time'].fillna(matches_df['DB_LastUpdated'], inplace=True)
-
-        # Save matches to a report file
-        if not matches_df.empty:
+        # Create DataFrame and drop duplicates to avoid reporting the same product multiple times
+        if matches:
+            matches_df = pd.DataFrame(matches)
+            matches_df = matches_df.drop_duplicates(subset=['Detected_Item'])
+            
+            # Format the detection time for better readability
+            matches_df['Detection_Time'] = pd.to_datetime(matches_df['Detection_Time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Save only the product and detection time to the final report
+            final_report = matches_df[['Detected_Item', 'Detection_Time']]
+            
+            # Generate the report file
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            report_filename = f'enhanced_comparison_report_{timestamp}.csv'
-            matches_df.to_csv(report_filename, index=False)
-            print(f"Enhanced comparison report generated: {report_filename}")
-            print(f"Found {len(matches)} matches with confidence > 60%")
+            report_filename = f'product_detection_report_{timestamp}.csv'
+            final_report.to_csv(report_filename, index=False)
+            print(f"Product detection report generated: {report_filename}")
+            print(f"Found {len(matches)} same-day products with confidence > 80%")
 
             # Send email with report
             email_address = os.getenv('EMAIL_ADDRESS')
@@ -183,7 +230,7 @@ def compare_detections():
             else:
                 print("Email credentials not fully configured. Skipping email.")
         else:
-            print("No matches found in the current time window")
+            print("No same-day matches found in the current time window")
 
     except Exception as e:
         print(f"Error during comparison: {e}")
@@ -193,6 +240,7 @@ def run_comparison_scheduler():
     interval_minutes = int(os.getenv('COMPARISON_INTERVAL_MINUTES', 5))
     
     print(f"Starting comparison scheduler (interval: {interval_minutes} minutes)")
+    print(f"NOTE: Only matching items detected on the SAME DAY as database entries")
     
     # Run initial comparison immediately
     compare_detections()
