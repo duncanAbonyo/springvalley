@@ -1,3 +1,4 @@
+#item_comparison_email.py
 import pandas as pd
 import time
 from datetime import datetime, timedelta
@@ -141,7 +142,6 @@ def send_email_report(email_address, email_password, recipient_email, report_fil
 
     except Exception as e:
         print(f"Error sending email: {e}")
-
 def compare_detections():
     """Compare detected items with database entries"""
     try:
@@ -149,7 +149,7 @@ def compare_detections():
         detections_df = pd.read_csv('detections.csv')
         
         # Convert timestamp strings to datetime objects
-        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'], format='%Y-%m-%d_%H-%M-%S', errors='coerce')
+        detections_df['Timestamp'] = pd.to_datetime(detections_df['Timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
 
         # Get database items
         db_items = get_db_items()
@@ -169,9 +169,6 @@ def compare_detections():
             detected_object = detection['Object']
             normalized_detected = normalize_text(detected_object)
 
-            # Convert confidence to percentage for reporting
-            confidence_pct = detection['Confidence'] * 100
-
             best_match = None
             highest_ratio = 0
 
@@ -183,10 +180,9 @@ def compare_detections():
                     
                     # CRITICAL: Only consider matches from the same day
                     if detection_time.date() == db_time.date():
-                        # Only consider matches where:
-                        # 1. The fuzzy match ratio is > 80
-                        # 2. The confidence is > 0.5 (50%)
-                        if ratio > highest_ratio and ratio > 80 and detection['Confidence'] > 0.5:
+                        # Lowered fuzzy match threshold to 60%
+                        # Removed confidence threshold
+                        if ratio > highest_ratio and ratio > 60:
                             highest_ratio = ratio
                             best_match = (db_desc, db_time)
             
@@ -218,7 +214,7 @@ def compare_detections():
             report_filename = f'product_detection_report_{timestamp}.csv'
             final_report.to_csv(report_filename, index=False)
             print(f"Product detection report generated: {report_filename}")
-            print(f"Found {len(matches)} same-day products with confidence > 80%")
+            print(f"Found {len(matches)} same-day products with fuzzy match > 60%")
 
             # Send email with report
             email_address = os.getenv('EMAIL_ADDRESS')
@@ -234,7 +230,7 @@ def compare_detections():
 
     except Exception as e:
         print(f"Error during comparison: {e}")
-
+        
 def run_comparison_scheduler():
     """Run the comparison at specified intervals"""
     interval_minutes = int(os.getenv('COMPARISON_INTERVAL_MINUTES', 5))
